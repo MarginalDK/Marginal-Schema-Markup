@@ -16,11 +16,25 @@ final class Marginal_Schema_Output {
 	const META_KEY      = '_marginal_schema_jsonld';
 
 	/**
-	 * Om side-specifik JSON-LD forventedes udskrevet i denne request.
+	 * Om WordPress er nået til at indlæse en skabelon i denne request.
 	 *
-	 * @var int
+	 * @var bool
 	 */
-	private static $pending_post_id = 0;
+	private static $template_request = false;
+
+	/**
+	 * Om print_global() er blevet kørt i denne request.
+	 *
+	 * @var bool
+	 */
+	private static $global_handled = false;
+
+	/**
+	 * Om print_post() er blevet kørt i denne request.
+	 *
+	 * @var bool
+	 */
+	private static $post_handled = false;
 
 	/**
 	 * Registrér hooks.
@@ -32,8 +46,10 @@ final class Marginal_Schema_Output {
 		add_action( 'wp_head', array( __CLASS__, 'print_global' ), 5 );
 		add_action( 'wp_head', array( __CLASS__, 'print_post' ), PHP_INT_MAX );
 
-		add_action( 'template_redirect', array( __CLASS__, 'remember_pending' ), PHP_INT_MAX );
-		add_action( 'shutdown', array( __CLASS__, 'detect_missing_head' ) );
+		// template_include kører først, når WordPress rent faktisk skal vise en side – efter
+		// redirects, feeds, robots.txt og HEAD-requests (som WordPress stopper før skabelonen).
+		add_filter( 'template_include', array( __CLASS__, 'mark_template_request' ), PHP_INT_MAX );
+		add_action( 'shutdown', array( __CLASS__, 'detect_missing_output' ) );
 	}
 
 	/**
@@ -63,9 +79,9 @@ final class Marginal_Schema_Output {
 					'single'            => true,
 					'show_in_rest'      => false,
 					'sanitize_callback' => array( 'Marginal_Schema_Json', 'sanitize_input' ),
-					'auth_callback'     => static function ( $allowed, $meta_key, $post_id ) {
-						return current_user_can( 'edit_post', (int) $post_id );
-					},
+					// Feltet ændres kun via pluginnets eget felt (kun administratorer). Ingen andre veje –
+					// XML-RPC, REST API eller "Brugerdefinerede felter" – må kunne læse eller ændre det.
+					'auth_callback'     => '__return_false',
 				)
 			);
 		}
@@ -75,6 +91,8 @@ final class Marginal_Schema_Output {
 	 * Udskriv global JSON-LD.
 	 */
 	public static function print_global() {
+		self::$global_handled = true;
+
 		try {
 			$raw = get_option( self::OPTION_GLOBAL, '' );
 			if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
@@ -100,11 +118,10 @@ final class Marginal_Schema_Output {
 	 * Udskriv side-specifik JSON-LD.
 	 */
 	public static function print_post() {
-		$post_id = 0;
+		self::$post_handled = true;
+		$post_id            = 0;
 
 		try {
-			self::$pending_post_id = 0;
-
 			$post_id = self::current_post_id();
 			if ( ! $post_id ) {
 				return;
@@ -163,62 +180,100 @@ final class Marginal_Schema_Output {
 			return 0;
 		}
 
+		// Heller ikke fra private eller ikke-udgivne sider (fx en privat "Indlægsside"),
+		// medmindre den besøgende selv må se siden.
+		if ( ! is_post_publicly_viewable( $post ) && ! current_user_can( 'read_post', $post->ID ) ) {
+			return 0;
+		}
+
 		return $post_id;
 	}
 
 	/**
-	 * Husk om den aktuelle side har JSON-LD, så vi kan opdage hvis temaet aldrig kalder wp_head().
+	 * Markér at WordPress viser en side med en skabelon.
+	 *
+	 * @param string $template Skabelonens sti (returneres uændret).
+	 * @return string
 	 */
-	public static function remember_pending() {
+	public static function mark_template_request( $template ) {
+		self::$template_request = true;
+		return $template;
+	}
+
+	/**
+	 * Log hvis JSON-LD skulle have været udskrevet, men ikke blev det – fordi temaet ikke
+	 * kalder wp_head(), eller fordi et tema/plugin har fjernet pluginnets hook.
+	 */
+	public static function detect_missing_output() {
 		try {
-			$post_id = self::current_post_id();
-			if ( $post_id ) {
-				$raw = get_post_meta( $post_id, self::META_KEY, true );
+			// Normale sidevisninger slutter her med det samme.
+			if ( ! self::$template_request || ( self::$global_handled && self::$post_handled ) ) {
+				return;
+			}
+			if ( ! self::is_html_page_response() ) {
+				return;
+			}
+
+			$reason = did_action( 'wp_head' )
+				? 'et tema eller plugin har fjernet pluginnets udskrivning fra wp_head'
+				: 'temaet/skabelonen ikke kalder wp_head()';
+
+			if ( ! self::$global_handled ) {
+				$raw = get_option( self::OPTION_GLOBAL, '' );
 				if ( is_string( $raw ) && '' !== trim( $raw ) ) {
-					self::$pending_post_id = $post_id;
+					Marginal_Schema_Logger::error( sprintf( 'Global JSON-LD blev ikke udskrevet, fordi %s.', $reason ) );
+				}
+			}
+
+			if ( ! self::$post_handled ) {
+				$post_id = self::current_post_id();
+				$raw     = $post_id ? get_post_meta( $post_id, self::META_KEY, true ) : '';
+				if ( is_string( $raw ) && '' !== trim( $raw ) ) {
+					Marginal_Schema_Logger::error(
+						sprintf( 'JSON-LD blev ikke udskrevet på "%s", fordi %s.', self::post_label( $post_id ), $reason ),
+						$post_id
+					);
 				}
 			}
 		} catch ( \Throwable $e ) {
-			self::$pending_post_id = 0;
+			unset( $e );
 		}
 	}
 
 	/**
-	 * Hvis siden har JSON-LD, men temaet/page builderen aldrig kaldte wp_head(), logges det.
+	 * Er dette en almindelig HTML-sidevisning, hvor <head> burde være udskrevet?
+	 *
+	 * @return bool
 	 */
-	public static function detect_missing_head() {
-		try {
-			if ( ! self::$pending_post_id || did_action( 'wp_head' ) ) {
-				return;
-			}
-			if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
-				return;
-			}
-			if ( is_feed() || is_embed() || is_robots() || is_trackback() ) {
-				return;
-			}
-			// http_response_code() giver false uden for en web-request (fx WP-CLI).
-			$status = function_exists( 'http_response_code' ) ? http_response_code() : false;
-			if ( false !== $status && 200 !== (int) $status ) {
-				return;
-			}
-			// Kun HTML-svar (ikke redirects, filer o.l.).
-			foreach ( headers_list() as $header ) {
-				if ( 0 === stripos( $header, 'content-type:' ) && false === stripos( $header, 'text/html' ) ) {
-					return;
-				}
-			}
-
-			Marginal_Schema_Logger::error(
-				sprintf(
-					'JSON-LD kunne ikke udskrives på "%s", fordi temaet/skabelonen ikke kalder wp_head().',
-					self::post_label( self::$pending_post_id )
-				),
-				self::$pending_post_id
-			);
-		} catch ( \Throwable $e ) {
-			unset( $e );
+	private static function is_html_page_response() {
+		if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return false;
 		}
+
+		// HEAD-requests (fx fra oppetidsovervågning) får aldrig et <head> – WordPress stopper før skabelonen.
+		$method = isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_key( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) : '';
+		if ( 'head' === $method ) {
+			return false;
+		}
+
+		if ( is_feed() || is_embed() || is_robots() || is_favicon() || is_trackback() ) {
+			return false;
+		}
+
+		// http_response_code() giver false uden for en web-request (fx WP-CLI).
+		$status = function_exists( 'http_response_code' ) ? http_response_code() : false;
+		if ( false !== $status && 200 !== (int) $status ) {
+			return false;
+		}
+
+		// Kun HTML-svar (ikke fx filer eller JSON).
+		foreach ( headers_list() as $header ) {
+			if ( 0 === stripos( $header, 'content-type:' ) && false === stripos( $header, 'text/html' ) ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**

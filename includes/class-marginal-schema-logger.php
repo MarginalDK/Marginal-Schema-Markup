@@ -189,6 +189,7 @@ final class Marginal_Schema_Logger {
 		$uri  = wp_unslash( $_SERVER['REQUEST_URI'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- saniteres nedenfor.
 		$path = wp_parse_url( (string) $uri, PHP_URL_PATH );
 
-		return is_string( $path ) ? substr( sanitize_text_field( $path ), 0, 255 ) : '';
+		// UTF-8-sikker afkortning: et halvt tegn ville få databasen til at afvise hele loggen.
+		return is_string( $path ) ? Marginal_Schema_Json::truncate_utf8( sanitize_text_field( $path ), 255 ) : '';
 	}
 }

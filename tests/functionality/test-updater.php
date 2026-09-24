@@ -133,6 +133,108 @@ class Test_Marginal_Schema_Updater extends Marginal_Schema_TestCase {
 		);
 	}
 
+	public function test_asset_from_another_release_is_rejected() {
+		$release = $this->release( 'v9.9.9' );
+
+		$release['assets'][0]['browser_download_url'] = Marginal_Schema_Updater::REPO_URL . '/releases/download/v1.0.0/marginal-schema-markup.zip';
+		$this->mock_github( $release, null );
+
+		$this->assertFalse( $this->filter_update() );
+		$this->assertStringContainsString( 'mangler filen', implode( ' ', $this->log_messages() ) );
+	}
+
+	public function test_package_url_with_trailing_newline_is_rejected() {
+		$ours = array( 'plugin' => Marginal_Schema_Updater::basename() );
+		$url  = Marginal_Schema_Updater::REPO_URL . "/releases/download/v1.2.3/marginal-schema-markup.zip\n";
+		$this->assertWPError( Marginal_Schema_Updater::verify_package_url( false, $url, null, $ours ) );
+	}
+
+	/**
+	 * Registrér de timeouts, der bruges ved kald til GitHub.
+	 *
+	 * @return object
+	 */
+	private function record_timeouts() {
+		$seen = (object) array( 'timeouts' => array() );
+		add_filter(
+			'pre_http_request',
+			static function ( $pre, $args, $url ) use ( $seen ) {
+				if ( false !== strpos( $url, 'github' ) ) {
+					$seen->timeouts[] = $args['timeout'];
+				}
+				return $pre;
+			},
+			1,
+			3
+		);
+		return $seen;
+	}
+
+	public function test_short_timeout_when_a_user_is_waiting() {
+		$seen = $this->record_timeouts();
+		$this->mock_github( $this->release(), self::HEADER );
+		$this->filter_update();
+
+		$this->assertCount( 2, $seen->timeouts );
+		foreach ( $seen->timeouts as $timeout ) {
+			$this->assertLessThanOrEqual( 3, $timeout, 'En admin-side må ikke hænge længe, hvis GitHub er langsomt.' );
+		}
+	}
+
+	public function test_longer_timeout_in_background_cron() {
+		add_filter( 'wp_doing_cron', '__return_true' );
+		$seen = $this->record_timeouts();
+		$this->mock_github( $this->release(), self::HEADER );
+		$this->filter_update();
+
+		$this->assertSame( array( 10, 10 ), $seen->timeouts );
+	}
+
+	public function test_failed_check_is_cached_for_six_hours() {
+		$this->mock_github( null, null, 500 );
+		$this->filter_update();
+
+		$name    = '_site_transient_timeout_' . Marginal_Schema_Updater::TRANSIENT;
+		$expires = (int) ( is_multisite() ? get_site_option( $name ) : get_option( $name ) );
+		$this->assertGreaterThanOrEqual( time() + 6 * HOUR_IN_SECONDS - 60, $expires );
+	}
+
+	public function test_check_is_locked_while_github_is_contacted() {
+		$state = (object) array( 'during' => null );
+		add_filter(
+			'pre_http_request',
+			static function ( $pre, $args, $url ) use ( $state ) {
+				if ( 0 === strpos( $url, Marginal_Schema_Updater::API_URL ) ) {
+					$state->during = get_site_transient( Marginal_Schema_Updater::TRANSIENT );
+				}
+				return $pre;
+			},
+			1,
+			3
+		);
+		$this->mock_github( $this->release(), null );
+		$this->filter_update();
+
+		$this->assertIsArray( $state->during );
+		$this->assertTrue( $state->during['error'], 'Andre requests skal ikke også vente på GitHub, mens et tjek er i gang.' );
+		$this->assertSame( '9.9.9', get_site_transient( Marginal_Schema_Updater::TRANSIENT )['version'] );
+	}
+
+	public function test_long_danish_release_notes_do_not_break_the_cache() {
+		// Et "æ" lige på grænsen blev tidligere klippet midt over, så databasen afviste cachen.
+		$body = str_repeat( 'a', Marginal_Schema_Updater::MAX_BODY_BYTES - 1 ) . 'æøå og mere tekst';
+		$this->mock_github( $this->release( 'v9.9.9', array( 'body' => $body ) ), null );
+		$this->filter_update();
+
+		$cached = get_site_transient( Marginal_Schema_Updater::TRANSIENT );
+		$this->assertIsArray( $cached );
+		$this->assertSame( $cached['body'], wp_check_invalid_utf8( $cached['body'] ), 'Release-noterne skal være gyldig UTF-8.' );
+		$this->assertLessThanOrEqual( Marginal_Schema_Updater::MAX_BODY_BYTES, strlen( $cached['body'] ) );
+
+		$info = Marginal_Schema_Updater::plugins_api( false, 'plugin_information', (object) array( 'slug' => Marginal_Schema_Updater::slug() ) );
+		$this->assertNotSame( '', trim( wp_strip_all_tags( $info->sections['changelog'] ) ) );
+	}
+
 	public function test_version_mismatch_between_tag_and_plugin_file_is_rejected() {
 		$this->mock_github( $this->release( 'v9.9.9' ), str_replace( '9.9.9', '9.9.8', self::HEADER ) );
 		$this->assertFalse( $this->filter_update() );

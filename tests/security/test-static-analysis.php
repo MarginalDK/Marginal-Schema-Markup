@@ -214,6 +214,40 @@ class Test_Marginal_Schema_Security_Static extends Marginal_Schema_TestCase {
 		$this->addToAssertionCount( 1 );
 	}
 
+	public function test_entry_files_have_no_top_level_function_declarations() {
+		// PHP "hejser" funktioner på øverste niveau. Indlæses filen to gange (fx to kopier af
+		// pluginnet), giver det en fatal fejl, før nogen guard kan nå at køre.
+		foreach ( array( 'marginal-schema-markup.php', 'uninstall.php' ) as $name ) {
+			$tokens = token_get_all( (string) file_get_contents( MARGINAL_SCHEMA_TESTS_ROOT . '/' . $name ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+			$depth  = 0;
+			$count  = count( $tokens );
+
+			for ( $i = 0; $i < $count; $i++ ) {
+				$token = $tokens[ $i ];
+				if ( '{' === $token || ( is_array( $token ) && in_array( $token[0], array( T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES ), true ) ) ) {
+					++$depth;
+					continue;
+				}
+				if ( '}' === $token ) {
+					--$depth;
+					continue;
+				}
+				if ( 0 !== $depth || ! is_array( $token ) || T_FUNCTION !== $token[0] ) {
+					continue;
+				}
+				// Closures (function () ...) er fine – kun navngivne funktioner er et problem.
+				$next = $i + 1;
+				while ( $next < $count && is_array( $tokens[ $next ] ) && T_WHITESPACE === $tokens[ $next ][0] ) {
+					++$next;
+				}
+				if ( $next < $count && is_array( $tokens[ $next ] ) && T_STRING === $tokens[ $next ][0] ) {
+					$this->fail( "$name linje {$token[2]}: funktionen {$tokens[ $next ][1]}() er erklæret på øverste niveau. Læg den i en if-blok eller brug en closure." );
+				}
+			}
+		}
+		$this->addToAssertionCount( 1 );
+	}
+
 	public function test_files_have_no_closing_php_tag_or_bom() {
 		foreach ( $this->plugin_php_files() as $file ) {
 			$code = (string) file_get_contents( $file ); // phpcs:ignore WordPress.WP.AlternativeFunctions

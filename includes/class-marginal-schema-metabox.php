@@ -3,7 +3,7 @@
  * Felt til side-specifik JSON-LD på redigeringsskærmen for Pages.
  *
  * Bruger en klassisk meta box, som virker i både blok-editoren (Gutenberg)
- * og den klassiske editor.
+ * og den klassiske editor. Kun administratorer kan se og ændre feltet.
  *
  * @package Marginal_Schema_Markup
  */
@@ -29,12 +29,33 @@ final class Marginal_Schema_Metabox {
 	}
 
 	/**
+	 * Nonce-handling for en bestemt side. Nonce'n er bundet til siden, så feltet aldrig kan
+	 * gemmes på en anden side, der tilfældigvis gemmes i samme request (fx af et oversættelses-
+	 * eller synkroniseringsplugin).
+	 *
+	 * @param int $post_id Side-ID.
+	 * @return string
+	 */
+	public static function nonce_action( $post_id ) {
+		return self::NONCE_ACTION . '_' . (int) $post_id;
+	}
+
+	/**
+	 * Må den aktuelle bruger bruge feltet?
+	 *
+	 * @return bool
+	 */
+	private static function user_can_use() {
+		return current_user_can( Marginal_Schema_Admin::CAPABILITY );
+	}
+
+	/**
 	 * Tilføj meta box.
 	 *
 	 * @param string $post_type Indholdstype.
 	 */
 	public static function add( $post_type ) {
-		if ( ! in_array( $post_type, Marginal_Schema_Output::post_types(), true ) ) {
+		if ( ! in_array( $post_type, Marginal_Schema_Output::post_types(), true ) || ! self::user_can_use() ) {
 			return;
 		}
 
@@ -49,12 +70,12 @@ final class Marginal_Schema_Metabox {
 	}
 
 	/**
-	 * Indlæs admin-assets kun på redigeringsskærmen.
+	 * Indlæs admin-assets kun på redigeringsskærmen og kun for administratorer.
 	 *
 	 * @param string $hook Admin-side.
 	 */
 	public static function enqueue( $hook ) {
-		if ( 'post.php' !== $hook && 'post-new.php' !== $hook ) {
+		if ( ( 'post.php' !== $hook && 'post-new.php' !== $hook ) || ! self::user_can_use() ) {
 			return;
 		}
 		$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
@@ -74,9 +95,9 @@ final class Marginal_Schema_Metabox {
 			$value = get_post_meta( $post->ID, Marginal_Schema_Output::META_KEY, true );
 			$value = is_string( $value ) ? $value : '';
 
-			wp_nonce_field( self::NONCE_ACTION, self::NONCE_FIELD );
+			wp_nonce_field( self::nonce_action( $post->ID ), self::NONCE_FIELD, false );
 
-			echo '<p>' . esc_html__( 'Indsæt JSON-LD der kun gælder for denne side. Det udskrives nederst i <head>, efter den globale JSON-LD. Du kan indsætte ren JSON eller hele <script type="application/ld+json">-blokken.', 'marginal-schema-markup' ) . '</p>';
+			echo '<p>' . esc_html__( 'Indsæt JSON-LD der kun gælder for denne side. Det udskrives nederst i <head>, efter den globale JSON-LD. Du kan indsætte ren JSON eller hele <script type="application/ld+json">-blokken. Kun administratorer kan se og ændre feltet.', 'marginal-schema-markup' ) . '</p>';
 
 			Marginal_Schema_Admin::render_textarea( self::FIELD, self::FIELD, $value, 14 );
 
@@ -105,7 +126,12 @@ final class Marginal_Schema_Metabox {
 		}
 
 		$nonce = sanitize_text_field( wp_unslash( $_POST[ self::NONCE_FIELD ] ) );
-		if ( ! wp_verify_nonce( $nonce, self::NONCE_ACTION ) ) {
+		if ( ! wp_verify_nonce( $nonce, self::nonce_action( $post_id ) ) ) {
+			return;
+		}
+
+		// Formularen skal høre til netop denne side (ikke en anden side, der gemmes i samme request).
+		if ( ! isset( $_POST['post_ID'] ) || absint( wp_unslash( $_POST['post_ID'] ) ) !== (int) $post_id ) {
 			return;
 		}
 
@@ -117,17 +143,28 @@ final class Marginal_Schema_Metabox {
 			return;
 		}
 
-		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+		if ( ! self::user_can_use() || ! current_user_can( 'edit_post', $post_id ) ) {
 			return;
 		}
 
-		if ( ! isset( $_POST[ self::FIELD ] ) ) {
+		if ( ! isset( $_POST[ self::FIELD ] ) || ! is_string( $_POST[ self::FIELD ] ) ) {
 			return;
 		}
 
 		try {
-			// Renses i Marginal_Schema_Json::sanitize_input() (også via register_post_meta).
-			$value = Marginal_Schema_Json::sanitize_input( wp_unslash( $_POST[ self::FIELD ] ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+			$raw = wp_unslash( $_POST[ self::FIELD ] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- renses i Marginal_Schema_Json::sanitize_input().
+
+			// For stor værdi: afvis den og behold den tidligere version.
+			$size = Marginal_Schema_Json::check_size( $raw );
+			if ( is_wp_error( $size ) ) {
+				Marginal_Schema_Logger::warning(
+					sprintf( 'JSON-LD på "%s" (ID %d) blev ikke gemt: %s Den tidligere version er bevaret.', get_the_title( $post_id ), $post_id, $size->get_error_message() ),
+					$post_id
+				);
+				return;
+			}
+
+			$value = Marginal_Schema_Json::sanitize_input( $raw );
 
 			if ( '' === $value ) {
 				delete_post_meta( $post_id, Marginal_Schema_Output::META_KEY );

@@ -33,8 +33,20 @@ final class Marginal_Schema_Updater {
 	/** Hvor længe et vellykket tjek caches (sekunder). GitHub tillader 60 kald/time uden login. */
 	const CACHE_TTL = 21600;
 
-	/** Hvor længe der ventes efter et fejlet tjek. */
-	const ERROR_TTL = 3600;
+	/** Hvor længe der ventes efter et fejlet tjek (6 timer), så et utilgængeligt GitHub ikke gør admin langsom. */
+	const ERROR_TTL = 21600;
+
+	/** Mens et tjek er i gang, venter andre requests ikke også på GitHub. */
+	const LOCK_TTL = 300;
+
+	/** Timeout i admin (en bruger venter på siden) – samme som WordPress' egne opdateringstjek. */
+	const TIMEOUT_INTERACTIVE = 3;
+
+	/** Timeout i baggrunden (WP-Cron), hvor ingen venter. */
+	const TIMEOUT_CRON = 10;
+
+	/** Maks. længde på release-noter, der gemmes (bytes). */
+	const MAX_BODY_BYTES = 20000;
 
 	/** Maks. pakkestørrelse (bytes) – beskyttelse mod forkerte filer. */
 	const MAX_PACKAGE_SIZE = 20971520;
@@ -276,6 +288,17 @@ final class Marginal_Schema_Updater {
 			return empty( $cached['error'] ) ? $cached : null;
 		}
 
+		// Markér tjekket som i gang, FØR GitHub kontaktes. Hænger forespørgslen, eller kører
+		// flere requests samtidig, venter de andre ikke også.
+		set_site_transient(
+			self::TRANSIENT,
+			array(
+				'error'   => true,
+				'checked' => time(),
+			),
+			self::LOCK_TTL
+		);
+
 		$release = self::fetch_release();
 
 		if ( is_wp_error( $release ) ) {
@@ -304,7 +327,7 @@ final class Marginal_Schema_Updater {
 		$response = wp_safe_remote_get(
 			self::API_URL,
 			array(
-				'timeout'     => 10,
+				'timeout'     => self::timeout(),
 				'redirection' => 3,
 				'user-agent'  => 'Marginal-Schema-Markup/' . MARGINAL_SCHEMA_VERSION,
 				'headers'     => array(
@@ -339,12 +362,14 @@ final class Marginal_Schema_Updater {
 		}
 
 		$tag = isset( $data['tag_name'] ) && is_string( $data['tag_name'] ) ? trim( $data['tag_name'] ) : '';
-		if ( ! preg_match( '/^v?(\d+\.\d+(?:\.\d+)?)$/', $tag, $m ) ) {
+		if ( ! preg_match( '/^v?(\d+\.\d+(?:\.\d+)?)$/D', $tag, $m ) ) {
 			return new WP_Error( 'marginal_schema_tag', 'Release-tag har et ugyldigt format (forventet fx v1.2.3).' );
 		}
 		$version = $m[1];
 
-		$package = '';
+		// Pakken skal ligge på netop denne release (ikke en anden releases fil).
+		$expected_url = self::REPO_URL . '/releases/download/' . $tag . '/' . self::ASSET_NAME;
+		$package      = '';
 		if ( ! empty( $data['assets'] ) && is_array( $data['assets'] ) ) {
 			foreach ( $data['assets'] as $asset ) {
 				if ( ! is_array( $asset ) || ! isset( $asset['name'], $asset['browser_download_url'] ) || self::ASSET_NAME !== $asset['name'] ) {
@@ -358,7 +383,7 @@ final class Marginal_Schema_Updater {
 					continue;
 				}
 				$url = (string) $asset['browser_download_url'];
-				if ( self::is_allowed_package_url( $url ) ) {
+				if ( $expected_url === $url && self::is_allowed_package_url( $url ) ) {
 					$package = $url;
 					break;
 				}
@@ -373,8 +398,10 @@ final class Marginal_Schema_Updater {
 			? $data['html_url']
 			: self::REPO_URL . '/releases';
 
+		// Afkortes uden at klippe æ/ø/å over: halve tegn får databasen til at afvise cachen,
+		// så GitHub ellers ville blive spurgt ved hvert eneste tjek.
 		$body = isset( $data['body'] ) && is_string( $data['body'] ) ? $data['body'] : '';
-		$body = substr( wp_strip_all_tags( $body ), 0, 20000 );
+		$body = Marginal_Schema_Json::truncate_utf8( wp_strip_all_tags( $body ), self::MAX_BODY_BYTES );
 
 		$release = array(
 			'version'      => $version,
@@ -416,7 +443,7 @@ final class Marginal_Schema_Updater {
 		$response = wp_safe_remote_get(
 			self::RAW_URL . rawurlencode( $tag ) . '/marginal-schema-markup.php',
 			array(
-				'timeout'             => 10,
+				'timeout'             => self::timeout(),
 				'redirection'         => 0,
 				'limit_response_size' => 16384,
 				'user-agent'          => 'Marginal-Schema-Markup/' . MARGINAL_SCHEMA_VERSION,
@@ -459,7 +486,16 @@ final class Marginal_Schema_Updater {
 
 		$rest = substr( $url, strlen( $prefix ) );
 
-		// Forventet format: <tag>/marginal-schema-markup.zip – ingen "..", query strings e.l.
-		return (bool) preg_match( '#^v?\d+\.\d+(?:\.\d+)?/' . preg_quote( self::ASSET_NAME, '#' ) . '$#', $rest );
+		// Forventet format: <tag>/marginal-schema-markup.zip – ingen "..", query strings, linjeskift e.l.
+		return (bool) preg_match( '#^v?\d+\.\d+(?:\.\d+)?/' . preg_quote( self::ASSET_NAME, '#' ) . '$#D', $rest );
+	}
+
+	/**
+	 * Timeout for kald til GitHub: kort når en bruger venter på siden, længere i baggrunden.
+	 *
+	 * @return int Sekunder.
+	 */
+	private static function timeout() {
+		return wp_doing_cron() ? self::TIMEOUT_CRON : self::TIMEOUT_INTERACTIVE;
 	}
 }

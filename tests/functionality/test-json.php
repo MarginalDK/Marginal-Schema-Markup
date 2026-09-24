@@ -61,8 +61,10 @@ class Test_Marginal_Schema_Json extends Marginal_Schema_TestCase {
 	}
 
 	public function test_too_large_input_is_rejected() {
-		$json = '{"a":"' . str_repeat( 'x', Marginal_Schema_Json::MAX_BYTES ) . '"}';
-		$this->assertWPError( Marginal_Schema_Json::validate( $json ) );
+		$json   = '{"a":"' . str_repeat( 'x', Marginal_Schema_Json::MAX_BYTES ) . '"}';
+		$result = Marginal_Schema_Json::validate( $json );
+		$this->assertWPError( $result );
+		$this->assertStringContainsString( 'for stor', $result->get_error_message() );
 	}
 
 	public function test_script_tag_has_correct_type_attribute() {
@@ -119,9 +121,88 @@ class Test_Marginal_Schema_Json extends Marginal_Schema_TestCase {
 		$this->assertSame( '', Marginal_Schema_Json::sanitize_input( 123 ) );
 	}
 
-	public function test_sanitize_truncates_oversized_input() {
-		$result = Marginal_Schema_Json::sanitize_input( str_repeat( 'a', Marginal_Schema_Json::MAX_BYTES + 5000 ) );
-		$this->assertLessThanOrEqual( Marginal_Schema_Json::MAX_BYTES, strlen( $result ) );
+	public function test_oversized_input_is_not_silently_truncated() {
+		$json   = '{"a":"' . str_repeat( 'x', Marginal_Schema_Json::MAX_BYTES ) . '"}';
+		$result = Marginal_Schema_Json::sanitize_input( $json );
+		$this->assertSame( $json, $result, 'For store værdier må ikke klippes over (det giver en forvirrende fejl).' );
+
+		$error = Marginal_Schema_Json::validate( $result );
+		$this->assertWPError( $error );
+		$this->assertSame( 'JSON-LD er for stor (201 KB – maks. 200 KB).', $error->get_error_message() );
+	}
+
+	public function test_check_size_boundary() {
+		$this->assertTrue( Marginal_Schema_Json::check_size( str_repeat( 'a', Marginal_Schema_Json::MAX_BYTES ) ) );
+		$this->assertWPError( Marginal_Schema_Json::check_size( str_repeat( 'a', Marginal_Schema_Json::MAX_BYTES + 1 ) ) );
+	}
+
+	public function test_too_large_number_fails_validation_with_clear_message() {
+		$result = Marginal_Schema_Json::validate( '{"@type":"Product","x":1e400}' );
+		$this->assertWPError( $result, '"Gyldig" skal betyde, at det også kan udskrives.' );
+		$this->assertStringContainsString( '1e400', $result->get_error_message() );
+	}
+
+	/**
+	 * @dataProvider validation_consistency_provider
+	 *
+	 * @param string $input Input.
+	 */
+	public function test_validate_agrees_with_output( $input ) {
+		$valid  = Marginal_Schema_Json::validate( $input );
+		$output = Marginal_Schema_Json::build_script_tag( $input, 'x' );
+		$this->assertSame( true === $valid, ! is_wp_error( $output ), 'validate() og det faktiske output skal altid være enige.' );
+	}
+
+	/**
+	 * @return array
+	 */
+	public function validation_consistency_provider() {
+		return array(
+			'gyldig'           => array( '{"@type":"Thing"}' ),
+			'tom'              => array( '' ),
+			'syntaksfejl'      => array( '{"a":' ),
+			'uendeligt tal'    => array( '{"a":-1e400}' ),
+			'stort heltal'     => array( '{"a":123456789012345678901234567890}' ),
+			'dybt indlejret'   => array( str_repeat( '[', 127 ) . str_repeat( ']', 127 ) ),
+			'for dybt'         => array( str_repeat( '[', 129 ) . str_repeat( ']', 129 ) ),
+			'for stor'         => array( '["' . str_repeat( 'x', Marginal_Schema_Json::MAX_BYTES ) . '"]' ),
+		);
+	}
+
+	public function test_wrapper_extraction_is_fast_on_pathological_input() {
+		// Tusindvis af "<script>" uden lukke-tag fik tidligere et regulært udtryk til at køre i sekunder
+		// (når PCRE JIT er slået fra, som på nogle servere).
+		$old = ini_get( 'pcre.jit' );
+		ini_set( 'pcre.jit', '0' ); // phpcs:ignore WordPress.PHP.IniSet.Risky
+		$start = microtime( true );
+		$input = str_repeat( '<script>', (int) ( Marginal_Schema_Json::MAX_BYTES / 8 ) );
+		$this->assertSame( $input, Marginal_Schema_Json::sanitize_input( $input ) );
+		$seconds = microtime( true ) - $start;
+		ini_set( 'pcre.jit', $old ); // phpcs:ignore WordPress.PHP.IniSet.Risky
+
+		$this->assertLessThan( 1.0, $seconds );
+	}
+
+	public function test_script_like_tags_are_not_treated_as_wrappers() {
+		$this->assertSame( '<scripts>{"a":1}</scripts>', Marginal_Schema_Json::sanitize_input( '<scripts>{"a":1}</scripts>' ) );
+	}
+
+	public function test_closing_tag_with_whitespace_is_accepted() {
+		$this->assertSame( '{"a":1}', Marginal_Schema_Json::sanitize_input( "<SCRIPT type=\"application/ld+json\">{\"a\":1}</script \n>" ) );
+	}
+
+	public function test_empty_wrappers_give_empty_value() {
+		$this->assertSame( '', Marginal_Schema_Json::sanitize_input( '<script type="application/ld+json"></script>' ) );
+	}
+
+	public function test_truncate_utf8_never_cuts_a_character() {
+		$text = str_repeat( 'a', 9 ) . 'æøå';
+		for ( $max = 8; $max <= strlen( $text ); $max++ ) {
+			$cut = Marginal_Schema_Json::truncate_utf8( $text, $max );
+			$this->assertLessThanOrEqual( $max, strlen( $cut ) );
+			$this->assertSame( $cut, wp_check_invalid_utf8( $cut ), "Ugyldig UTF-8 ved $max bytes." );
+		}
+		$this->assertSame( 'kort', Marginal_Schema_Json::truncate_utf8( 'kort', 100 ) );
 	}
 
 	public function test_sanitize_is_idempotent() {

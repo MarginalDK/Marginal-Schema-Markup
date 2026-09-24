@@ -51,17 +51,32 @@ class Test_Marginal_Schema_Admin extends Marginal_Schema_TestCase {
 	public function test_invalid_global_is_kept_but_warned_once() {
 		global $wp_settings_errors;
 		$wp_settings_errors = array(); // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
-		$prop = new ReflectionProperty( 'Marginal_Schema_Admin', 'notice_added' );
-		if ( PHP_VERSION_ID < 80100 ) {
-			$prop->setAccessible( true );
-		}
-		$prop->setValue( null, false );
+		$this->set_static( 'Marginal_Schema_Admin', 'notice_added', false );
 
 		$this->assertSame( '{"a":', Marginal_Schema_Admin::sanitize_global( '{"a":' ) );
 		Marginal_Schema_Admin::sanitize_global( '{"a":' );
 
 		$this->assertCount( 1, get_settings_errors( Marginal_Schema_Output::OPTION_GLOBAL ) );
 		$this->assertStringContainsString( 'Ugyldig global JSON-LD', implode( ' ', $this->log_messages() ) );
+	}
+
+	public function test_oversized_global_is_rejected_and_previous_version_kept() {
+		global $wp_settings_errors;
+		$wp_settings_errors = array(); // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+		$this->set_static( 'Marginal_Schema_Admin', 'notice_added', false );
+
+		Marginal_Schema_Admin::register_settings();
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, '{"@type":"Organization"}' );
+		$this->set_static( 'Marginal_Schema_Admin', 'notice_added', false );
+
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, '{"a":"' . str_repeat( 'x', Marginal_Schema_Json::MAX_BYTES ) . '"}' );
+
+		$this->assertSame( '{"@type":"Organization"}', get_option( Marginal_Schema_Output::OPTION_GLOBAL ) );
+		$errors = get_settings_errors( Marginal_Schema_Output::OPTION_GLOBAL );
+		$this->assertCount( 1, $errors );
+		$this->assertStringContainsString( 'blev IKKE gemt', $errors[0]['message'] );
+		$this->assertStringContainsString( 'maks. 200 KB', $errors[0]['message'] );
+		$this->assertStringContainsString( 'blev ikke gemt', implode( ' ', $this->log_messages() ) );
 	}
 
 	public function test_render_global_tab() {

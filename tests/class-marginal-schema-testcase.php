@@ -26,6 +26,7 @@ abstract class Marginal_Schema_TestCase extends WP_UnitTestCase {
 		delete_option( Marginal_Schema_Logger::OPTION );
 		delete_site_transient( Marginal_Schema_Updater::TRANSIENT );
 		$this->reset_logger_request_cache();
+		$this->reset_output_request_state();
 
 		// Sikkerhedsnet: ingen test må lave rigtige HTTP-kald. Tests der har brug for
 		// HTTP, registrerer selv et pre_http_request-filter med højere prioritet.
@@ -151,11 +152,49 @@ abstract class Marginal_Schema_TestCase extends WP_UnitTestCase {
 	 * Loggerens "allerede logget i denne request"-cache.
 	 */
 	protected function reset_logger_request_cache() {
-		$prop = new ReflectionProperty( 'Marginal_Schema_Logger', 'seen' );
+		$this->set_static( 'Marginal_Schema_Logger', 'seen', array() );
+	}
+
+	/**
+	 * Output-klassens tilstand for "denne request" (bruges til at opdage manglende output).
+	 */
+	protected function reset_output_request_state() {
+		foreach ( array( 'template_request', 'global_handled', 'post_handled' ) as $property ) {
+			$this->set_static( 'Marginal_Schema_Output', $property, false );
+		}
+	}
+
+	/**
+	 * Sæt en privat statisk egenskab.
+	 *
+	 * @param string $class    Klasse.
+	 * @param string $property Egenskab.
+	 * @param mixed  $value    Værdi.
+	 */
+	protected function set_static( $class, $property, $value ) {
+		$prop = new ReflectionProperty( $class, $property );
 		if ( PHP_VERSION_ID < 80100 ) {
 			$prop->setAccessible( true );
 		}
-		$prop->setValue( null, array() );
+		$prop->setValue( null, $value );
+	}
+
+	/**
+	 * $_POST-data som redigeringsformularen sender for en side (WordPress slasher altid $_POST).
+	 *
+	 * @param int         $post_id Siden formularen hører til.
+	 * @param string      $value   JSON-LD.
+	 * @param string|null $nonce   Nonce (null = gyldig nonce for siden).
+	 * @return array
+	 */
+	protected function metabox_post( $post_id, $value, $nonce = null ) {
+		return wp_slash(
+			array(
+				'post_ID'                            => (string) $post_id,
+				Marginal_Schema_Metabox::NONCE_FIELD => null === $nonce ? wp_create_nonce( Marginal_Schema_Metabox::nonce_action( $post_id ) ) : $nonce,
+				Marginal_Schema_Metabox::FIELD       => $value,
+			)
+		);
 	}
 
 	/**

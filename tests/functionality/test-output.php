@@ -203,35 +203,147 @@ class Test_Marginal_Schema_Output extends Marginal_Schema_TestCase {
 		$this->assertCount( 0, $this->extract_blocks( $this->render_head() ) );
 	}
 
-	public function test_missing_wp_head_is_detected_and_logged() {
-		$page_id = $this->create_page_with_jsonld( self::PAGE_JSON );
-		$this->go_to( get_permalink( $page_id ) );
-
-		Marginal_Schema_Output::remember_pending();
-
-		// Simulér at wp_head aldrig blev kørt.
+	/**
+	 * Simulér en sidevisning: WordPress når til skabelonen (template_include), og så
+	 * kører $render (fx wp_head) – eller ikke – før shutdown.
+	 *
+	 * @param callable|null $render Hvad skabelonen gør.
+	 */
+	private function simulate_page_view( $render = null ) {
 		global $wp_actions;
 		$saved = isset( $wp_actions['wp_head'] ) ? $wp_actions['wp_head'] : null;
 		unset( $wp_actions['wp_head'] );
 
-		Marginal_Schema_Output::detect_missing_head();
+		apply_filters( 'template_include', 'template.php' );
+		if ( $render ) {
+			$this->capture( $render );
+		}
+		Marginal_Schema_Output::detect_missing_output();
 
+		unset( $wp_actions['wp_head'] );
 		if ( null !== $saved ) {
 			$wp_actions['wp_head'] = $saved; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
 		}
-
-		$this->assertStringContainsString( 'wp_head()', implode( ' ', $this->log_messages() ) );
 	}
 
-	public function test_no_missing_head_warning_when_wp_head_ran() {
+	public function test_missing_wp_head_is_detected_and_logged() {
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, self::GLOBAL_JSON );
+		$page_id = $this->create_page_with_jsonld( self::PAGE_JSON, array( 'post_title' => 'Kontakt' ) );
+		$this->go_to( get_permalink( $page_id ) );
+
+		$this->simulate_page_view(); // Temaet kalder aldrig wp_head().
+
+		$messages = implode( ' | ', $this->log_messages() );
+		$this->assertStringContainsString( 'Global JSON-LD blev ikke udskrevet, fordi temaet/skabelonen ikke kalder wp_head()', $messages );
+		$this->assertStringContainsString( 'JSON-LD blev ikke udskrevet på "Kontakt (ID ' . $page_id . ')", fordi temaet/skabelonen ikke kalder wp_head()', $messages );
+	}
+
+	public function test_no_warning_when_wp_head_ran() {
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, self::GLOBAL_JSON );
 		$page_id = $this->create_page_with_jsonld( self::PAGE_JSON );
 		$this->go_to( get_permalink( $page_id ) );
 
-		Marginal_Schema_Output::remember_pending();
-		$this->render_head();
-		Marginal_Schema_Output::detect_missing_head();
+		$this->simulate_page_view( 'wp_head' );
 
 		$this->assertSame( array(), $this->log_messages() );
+	}
+
+	public function test_removed_output_hook_is_detected_and_logged() {
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, self::GLOBAL_JSON );
+		$page_id = $this->create_page_with_jsonld( self::PAGE_JSON );
+		$this->go_to( get_permalink( $page_id ) );
+
+		// Fx et page builder-tema, der rydder wp_head for andres output.
+		remove_action( 'wp_head', array( 'Marginal_Schema_Output', 'print_global' ), 5 );
+		remove_action( 'wp_head', array( 'Marginal_Schema_Output', 'print_post' ), PHP_INT_MAX );
+		$this->simulate_page_view( 'wp_head' );
+
+		$entries = Marginal_Schema_Logger::get_entries();
+		$this->assertCount( 2, $entries );
+		foreach ( $entries as $entry ) {
+			$this->assertStringContainsString( 'har fjernet pluginnets udskrivning', $entry['message'] );
+		}
+	}
+
+	public function test_only_removed_page_output_is_reported() {
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, self::GLOBAL_JSON );
+		$page_id = $this->create_page_with_jsonld( self::PAGE_JSON );
+		$this->go_to( get_permalink( $page_id ) );
+
+		remove_action( 'wp_head', array( 'Marginal_Schema_Output', 'print_post' ), PHP_INT_MAX );
+		$this->simulate_page_view( 'wp_head' );
+
+		$entries = Marginal_Schema_Logger::get_entries();
+		$this->assertCount( 1, $entries );
+		$this->assertSame( $page_id, $entries[0]['post_id'] );
+	}
+
+	public function test_head_requests_are_not_reported() {
+		// Oppetidsovervågning bruger ofte HEAD. WordPress stopper så før skabelonen og <head>.
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, self::GLOBAL_JSON );
+		$page_id = $this->create_page_with_jsonld( self::PAGE_JSON );
+		$this->go_to( get_permalink( $page_id ) );
+
+		$_SERVER['REQUEST_METHOD'] = 'HEAD';
+		try {
+			// Selv hvis template_include skulle nå at køre, må en HEAD-request aldrig give en fejl.
+			$this->simulate_page_view();
+		} finally {
+			$_SERVER['REQUEST_METHOD'] = 'GET';
+		}
+
+		$this->assertSame( array(), $this->log_messages() );
+	}
+
+	public function test_requests_that_never_reach_a_template_are_ignored() {
+		// Fx redirects, feeds, robots.txt og HEAD-requests: template_include kører aldrig.
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, self::GLOBAL_JSON );
+		$page_id = $this->create_page_with_jsonld( self::PAGE_JSON );
+		$this->go_to( get_permalink( $page_id ) );
+
+		Marginal_Schema_Output::detect_missing_output();
+
+		$this->assertSame( array(), $this->log_messages() );
+	}
+
+	public function test_feeds_are_ignored() {
+		update_option( Marginal_Schema_Output::OPTION_GLOBAL, self::GLOBAL_JSON );
+		self::factory()->post->create();
+		$this->go_to( get_feed_link() );
+		$this->assertTrue( is_feed() );
+
+		$this->simulate_page_view();
+
+		$this->assertSame( array(), $this->log_messages() );
+	}
+
+	public function test_private_posts_page_does_not_leak_jsonld() {
+		$front_id = self::factory()->post->create( array( 'post_type' => 'page' ) );
+		$blog_id  = $this->create_page_with_jsonld( self::PAGE_JSON, array( 'post_status' => 'private' ) );
+		update_option( 'show_on_front', 'page' );
+		update_option( 'page_on_front', $front_id );
+		update_option( 'page_for_posts', $blog_id );
+
+		wp_set_current_user( 0 );
+		$this->go_to( add_query_arg( 'page_id', $blog_id, home_url( '/' ) ) );
+		$this->assertCount( 0, $this->extract_blocks( $this->render_head() ), 'Anonyme besøgende må ikke se JSON-LD fra en privat side.' );
+
+		// En administrator, der må se den private side, får den stadig.
+		$this->login_as( 'administrator' );
+		$this->go_to( add_query_arg( 'page_id', $blog_id, home_url( '/' ) ) );
+		$this->assertCount( 1, $this->extract_blocks( $this->render_head() ) );
+	}
+
+	public function test_draft_posts_page_does_not_leak_jsonld() {
+		$front_id = self::factory()->post->create( array( 'post_type' => 'page' ) );
+		$blog_id  = $this->create_page_with_jsonld( self::PAGE_JSON, array( 'post_status' => 'draft' ) );
+		update_option( 'show_on_front', 'page' );
+		update_option( 'page_on_front', $front_id );
+		update_option( 'page_for_posts', $blog_id );
+
+		wp_set_current_user( 0 );
+		$this->go_to( add_query_arg( 'page_id', $blog_id, home_url( '/' ) ) );
+		$this->assertCount( 0, $this->extract_blocks( $this->render_head() ) );
 	}
 
 	public function test_meta_is_registered_as_protected_and_hidden_from_rest() {
@@ -243,5 +355,10 @@ class Test_Marginal_Schema_Output extends Marginal_Schema_TestCase {
 		$registered = get_registered_meta_keys( 'post', 'page' );
 		$this->assertArrayHasKey( Marginal_Schema_Output::META_KEY, $registered );
 		$this->assertFalse( $registered[ Marginal_Schema_Output::META_KEY ]['show_in_rest'] );
+		$this->assertSame( '__return_false', $registered[ Marginal_Schema_Output::META_KEY ]['auth_callback'], 'Ingen må kunne ændre feltet via XML-RPC/REST.' );
+	}
+
+	public function test_template_include_filter_returns_template_unchanged() {
+		$this->assertSame( '/sti/til/skabelon.php', Marginal_Schema_Output::mark_template_request( '/sti/til/skabelon.php' ) );
 	}
 }

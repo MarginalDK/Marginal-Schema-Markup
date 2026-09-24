@@ -87,18 +87,21 @@ final class Marginal_Schema_Admin {
 	 */
 	public static function sanitize_global( $value ) {
 		try {
+			// For stor værdi: afvis den og behold den tidligere version.
+			if ( is_string( $value ) ) {
+				$size = Marginal_Schema_Json::check_size( $value );
+				if ( is_wp_error( $size ) ) {
+					self::add_error_once( __( 'Global JSON-LD blev IKKE gemt: ', 'marginal-schema-markup' ) . $size->get_error_message() . ' ' . __( 'Den tidligere version er bevaret.', 'marginal-schema-markup' ) );
+					Marginal_Schema_Logger::warning( 'Global JSON-LD blev ikke gemt: ' . $size->get_error_message() );
+					return self::current_global();
+				}
+			}
+
 			$value = Marginal_Schema_Json::sanitize_input( $value );
 
-			if ( '' !== $value && ! self::$notice_added ) {
+			if ( '' !== $value ) {
 				$valid = Marginal_Schema_Json::validate( $value );
-				if ( is_wp_error( $valid ) ) {
-					self::$notice_added = true;
-					add_settings_error(
-						Marginal_Schema_Output::OPTION_GLOBAL,
-						'marginal_schema_invalid',
-						__( 'JSON-LD er gemt, men er ugyldig og bliver IKKE udskrevet på siden: ', 'marginal-schema-markup' ) . $valid->get_error_message(),
-						'error'
-					);
+				if ( is_wp_error( $valid ) && self::add_error_once( __( 'JSON-LD er gemt, men er ugyldig og bliver IKKE udskrevet på siden: ', 'marginal-schema-markup' ) . $valid->get_error_message() ) ) {
 					Marginal_Schema_Logger::warning( 'Ugyldig global JSON-LD gemt: ' . $valid->get_error_message() );
 				}
 			}
@@ -106,9 +109,34 @@ final class Marginal_Schema_Admin {
 			return $value;
 		} catch ( \Throwable $e ) {
 			Marginal_Schema_Logger::error( 'Global JSON-LD kunne ikke gemmes: ' . $e->getMessage() );
-			$old = get_option( Marginal_Schema_Output::OPTION_GLOBAL, '' );
-			return is_string( $old ) ? $old : '';
+			return self::current_global();
 		}
+	}
+
+	/**
+	 * Den gemte globale JSON-LD.
+	 *
+	 * @return string
+	 */
+	private static function current_global() {
+		$old = get_option( Marginal_Schema_Output::OPTION_GLOBAL, '' );
+		return is_string( $old ) ? $old : '';
+	}
+
+	/**
+	 * Vis en fejlbesked på indstillingssiden – kun én gang pr. gem (WordPress kan køre
+	 * sanitize-funktionen to gange, første gang en indstilling gemmes).
+	 *
+	 * @param string $message Besked.
+	 * @return bool True hvis beskeden blev tilføjet nu.
+	 */
+	private static function add_error_once( $message ) {
+		if ( self::$notice_added ) {
+			return false;
+		}
+		self::$notice_added = true;
+		add_settings_error( Marginal_Schema_Output::OPTION_GLOBAL, 'marginal_schema_invalid', $message, 'error' );
+		return true;
 	}
 
 	/**
@@ -141,11 +169,12 @@ final class Marginal_Schema_Admin {
 	 */
 	public static function render_textarea( $name, $id, $value, $rows ) {
 		printf(
-			'<textarea name="%1$s" id="%2$s" rows="%3$d" class="large-text code marginal-schema-json" spellcheck="false" autocomplete="off" autocapitalize="off">%4$s</textarea>',
+			'<textarea name="%1$s" id="%2$s" rows="%3$d" class="large-text code marginal-schema-json" spellcheck="false" autocomplete="off" autocapitalize="off" data-max-bytes="%5$d">%4$s</textarea>',
 			esc_attr( $name ),
 			esc_attr( $id ),
 			(int) $rows,
-			esc_textarea( $value )
+			esc_textarea( $value ),
+			(int) Marginal_Schema_Json::MAX_BYTES
 		);
 		echo '<div class="marginal-schema-toolbar">';
 		echo '<button type="button" class="button marginal-schema-format" data-target="' . esc_attr( $id ) . '">' . esc_html__( 'Formatér JSON', 'marginal-schema-markup' ) . '</button>';

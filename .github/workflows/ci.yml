@@ -1,0 +1,94 @@
+# Kører ved hvert push og pull request – og før hver release (se release.yml).
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Syntaks (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+      - name: php -l på alle filer
+        run: find . -name '*.php' -not -path './vendor/*' -not -path './.git/*' -print0 | xargs -0 -n1 php -l
+
+  phpcs:
+    name: Sikkerhed og kompatibilitet (PHPCS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          tools: composer
+      - run: composer install --no-interaction --no-progress
+      - name: WordPress Security + PHPCompatibility (PHP 7.4+)
+        run: vendor/bin/phpcs
+
+  tests:
+    name: Tests (PHP ${{ matrix.php }}, WordPress ${{ matrix.wp }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Laveste understøttede kombination.
+          - php: '7.4'
+            wp: '6.0'
+          - php: '7.4'
+            wp: 'latest'
+          - php: '8.1'
+            wp: 'latest'
+          - php: '8.3'
+            wp: 'latest'
+          - php: '8.4'
+            wp: 'latest'
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: wordpress_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      WP_DB_HOST: 127.0.0.1:3306
+      WP_DB_USER: root
+      WP_DB_PASSWORD: root
+      WP_DB_NAME: wordpress_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mysqli
+          coverage: none
+          tools: composer
+      - run: composer install --no-interaction --no-progress
+      - name: Installér WordPress ${{ matrix.wp }}
+        run: bash tests/bin/install-wp.sh "${{ matrix.wp }}" mysql
+      - name: Funktionstests
+        run: vendor/bin/phpunit --testsuite functionality
+      - name: Sikkerhedstests
+        run: vendor/bin/phpunit --testsuite security

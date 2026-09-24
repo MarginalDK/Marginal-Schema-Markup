@@ -1,0 +1,7 @@
+.DS_Store
+/build/
+/vendor/
+/.wp-tests/
+/composer.lock
+/marginal-schema-markup.zip
+.phpunit.result.cache

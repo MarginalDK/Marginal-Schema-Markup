@@ -1,0 +1,63 @@
+# Bygger marginal-schema-markup.zip og vedhæfter den til en GitHub-release.
+# WordPress-sites henter opdateringen fra netop denne fil.
+#
+# Hele test-suiten (syntaks, PHPCS, funktions- og sikkerhedstests) skal bestå først.
+# Fejler noget, vedhæftes der INGEN zip, og sites får ikke tilbudt opdateringen.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Byg og vedhæft zip
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tjek at tag matcher pluginnets version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -e
+          TAG_VERSION="${TAG#v}"
+          HEADER=$(grep -m1 -E '^\s*\*\s*Version:' marginal-schema-markup.php | sed -E 's/.*Version:\s*//' | tr -d '[:space:]')
+          CONST=$(grep -m1 "define( 'MARGINAL_SCHEMA_VERSION'" marginal-schema-markup.php | sed -E "s/.*'([0-9.]+)'.*/\1/")
+          echo "Tag: $TAG_VERSION  Header: $HEADER  Konstant: $CONST"
+          if ! echo "$TAG_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag skal have formatet v1.2.3"; exit 1
+          fi
+          if [ "$TAG_VERSION" != "$HEADER" ] || [ "$TAG_VERSION" != "$CONST" ]; then
+            echo "::error::Versionen i marginal-schema-markup.php (header og MARGINAL_SCHEMA_VERSION) skal være $TAG_VERSION"; exit 1
+          fi
+
+      - name: Byg zip (kun godkendte filer – aldrig tests, vendor eller .github)
+        run: |
+          set -e
+          mkdir -p build/marginal-schema-markup
+          cp marginal-schema-markup.php uninstall.php index.php README.md build/marginal-schema-markup/
+          cp -R includes assets build/marginal-schema-markup/
+          cd build
+          zip -r -X ../marginal-schema-markup.zip marginal-schema-markup
+          cd ..
+          unzip -l marginal-schema-markup.zip
+          unzip -l marginal-schema-markup.zip | grep -q ' marginal-schema-markup/marginal-schema-markup.php$'
+          if unzip -l marginal-schema-markup.zip | grep -Eq '/(tests|vendor|\.github|\.wp-tests)/'; then
+            echo "::error::Zip-filen indeholder udviklingsfiler"; exit 1
+          fi
+
+      - name: Vedhæft zip til release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" marginal-schema-markup.zip --clobber --repo "$GITHUB_REPOSITORY"
